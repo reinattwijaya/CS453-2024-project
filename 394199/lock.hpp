@@ -10,7 +10,7 @@ using namespace std;
  * exclusive locks have wait/wake_up capabilities.
  */
 struct lock_t {
-    atomic<int> version;
+    atomic<uint64_t> version;
 
     lock_t() : version(0) {}
 };
@@ -35,7 +35,7 @@ void lock_release(struct lock_t* lock);
  * @param lock Lock to query
  * @return Current version of the lock
 **/
-int get_version(struct lock_t* lock);
+uint64_t get_version(struct lock_t* lock);
 
 /** Get whether the lock is locked.
  * @param lock Lock to query
