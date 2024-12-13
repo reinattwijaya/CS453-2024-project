@@ -13,6 +13,7 @@ struct lock_t {
     atomic<uint64_t> version;
 
     lock_t() : version(0) {}
+    lock_t(const lock_t &lock){version = lock.version.load();}
 };
 
 /** Wait and acquire the given lock.

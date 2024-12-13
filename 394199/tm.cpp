@@ -52,17 +52,17 @@ struct Segment{
 struct Region {
     Region(size_t size, size_t align): 
         size(size), align(align), locks(500, vector<Segment>(1500)){}
-    atomic<int> global_version{0}; // Global version number
-    atomic<int> segment_count{1}; // Global segment count
-    vector<vector<Segment>> locks; //Lock for each segment
     size_t size;        // Size of the non-deallocable memory segment (in bytes)
     size_t align;       // Size of a word in the shared memory region (in bytes)
+    atomic<uint64_t> global_version{0}; // Global version number
+    atomic<uint64_t> segment_count{2}; // Global segment count
+    vector<vector<Segment>> locks; //Lock for each segment
 };
 
 struct Transaction {
     unordered_set<void*> read_set;
     multimap<void*, uint64_t> write_set;
-    int rv;
+    uint64_t rv;
     bool is_ro;
 };
 
@@ -105,7 +105,7 @@ void tm_destroy(shared_t shared) noexcept{
  * @param shared Shared memory region to query
  * @return Start address of the first allocated segment
 **/
-void* tm_start(shared_t shared) noexcept{
+void* tm_start(shared_t unused(shared)) noexcept{
     // cout << "starting" << endl;
     return (void *)((uint64_t)1 << 48);
 }
@@ -161,8 +161,6 @@ bool tm_end(shared_t shared, tx_t tx) noexcept{
         const auto& entry = *it;
         Segment &segment = get_segment(region, entry.first);
         lock_t &lock = segment.lock;
-        uint64_t &data = segment.data;
-        uint64_t version = get_version(&lock);
         if(!lock_acquire(&lock)){
             for(auto temp_it = end_tx->write_set.begin(); temp_it != it; ++temp_it){
                 Segment &temp_segment = get_segment(region, temp_it->first);
@@ -174,13 +172,12 @@ bool tm_end(shared_t shared, tx_t tx) noexcept{
         }
     }
 
-    int wv = region->global_version.fetch_add(1)+1;
+    uint64_t wv = region->global_version.fetch_add(1)+1;
 
     if(end_tx->rv + 1 != wv){
         for(const auto& entry: end_tx->read_set){
             Segment &segment = get_segment(region, entry);
             lock_t &lock = segment.lock;
-            uint64_t &data = segment.data;
             if (is_locked(&lock) || get_version(&lock) > end_tx->rv){
                 for(const auto& entry : end_tx->write_set){
                     Segment &temp_segment = get_segment(region, entry.first);
@@ -283,10 +280,10 @@ bool tm_write(shared_t unused(shared), tx_t tx, void const* source, size_t unuse
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) noexcept{
+Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t unused(size), void** target) noexcept{
     // cout << "allocating" << endl;
     Region* region = (Region*) shared;
-    *target = (void *)(region->segment_count.fetch_add(1) << 48);
+    *target = (void *)(region->segment_count.fetch_add(1) << 48ULL);
     return Alloc::success;
 }
 
