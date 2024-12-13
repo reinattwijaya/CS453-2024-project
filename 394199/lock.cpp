@@ -1,7 +1,8 @@
 #include "lock.hpp"
+#include <iostream>
 
 bool lock_acquire(struct lock_t* lock) {
-    int bounded_try = 5;
+    int bounded_try = 1;
     do {
         // We use the lock_word's LSB for the lock state and the rest for the version number
         int current = lock->version.load();
@@ -11,7 +12,7 @@ bool lock_acquire(struct lock_t* lock) {
         int desired = current | 1;  // Set the LSB to 1 (locked)
 
         // Perform CAS (Compare-And-Swap)
-        if (lock->version.compare_exchange_strong(expected, desired)) {
+        while (!lock->version.compare_exchange_strong(expected, desired)) {
             return true;  // Successfully acquired the lock
         }
         // If CAS fails, try again with the current value

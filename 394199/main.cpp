@@ -9,25 +9,25 @@ void read_and_write(shared_t shared){
     // sleep(1);
     tx_t tx = tm_begin(shared, false);
     int x = 5, x1 = 6;
-    tm_write(shared, tx, &x, sizeof(int), shared);
-    tm_write(shared, tx, &x1, sizeof(int), (void*)(static_cast<char*>(shared) + 40));
+    tm_write(shared, tx, &x, sizeof(int), tm_start(shared));
+    tm_write(shared, tx, &x1, sizeof(int), (void*)(static_cast<char*>(tm_start(shared)) + 8));
     int y = 0, y1 = 1;
-    tm_read(shared, tx, shared, sizeof(int), &y);
-    tm_read(shared, tx, (void*)(static_cast<char*>(shared) + 40), sizeof(int), &y1);
+    tm_read(shared, tx, tm_start(shared), sizeof(int), &y);
+    tm_read(shared, tx, (void*)(static_cast<char*>(tm_start(shared)) + 8), sizeof(int), &y1);
     cout << x << ' ' << y << ' ' << y1 << endl;
     if(!tm_end(shared, tx))
         cout << "TRANSACTION FAILED" << endl;
 }
 
 void read_and_write2(shared_t shared){
-    // sleep(1);
+    sleep(1);
     tx_t tx = tm_begin(shared, false);
     int x = 7, x1 = 8;
-    tm_write(shared, tx, &x, sizeof(int), shared);
-    tm_write(shared, tx, &x1, sizeof(int), (void*)(static_cast<char*>(shared) + 40));
+    // tm_write(shared, tx, &x, sizeof(int), shared);
+    // tm_write(shared, tx, &x1, sizeof(int), (void*)(static_cast<char*>(shared) + 40));
     int y = 0, y1 = 1;
-    tm_read(shared, tx, shared, sizeof(int), &y);
-    tm_read(shared, tx, (void*)(static_cast<char*>(shared) + 40), sizeof(int), &y1);
+    tm_read(shared, tx, tm_start(shared), sizeof(int), &y);
+    tm_read(shared, tx, (void*)(static_cast<char*>(tm_start(shared)) + 8), sizeof(int), &y1);
     cout << x << ' ' << y << ' ' << y1 << endl;
     if(!tm_end(shared, tx))
         cout << "TRANSACTION FAILED" << endl;
@@ -37,8 +37,8 @@ void read1(shared_t shared){
     sleep(1);
     tx_t tx = tm_begin(shared, false);
     int y = 0, y1 = 1;
-    tm_read(shared, tx, shared, sizeof(int), &y);
-    tm_read(shared, tx, (void*)(static_cast<char*>(shared) + 40), sizeof(int), &y1);
+    tm_read(shared, tx, tm_start(shared), sizeof(int), &y);
+    tm_read(shared, tx, (void*)(static_cast<char*>(tm_start(shared)) + 8), sizeof(int), &y1);
     cout << y << ' ' << y1 << endl;
     tm_end(shared, tx);
 }
