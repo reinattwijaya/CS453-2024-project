@@ -27,10 +27,13 @@
 #include <iostream>
 #include <cstdlib>
 #include <string>
+#include <cstring>
 #include <atomic>
 #include <unordered_set>
 #include <map>
+#include <memory>
 #include <shared_mutex>
+#include <vector>
 #include "lock.hpp"
 
 #include "macros.h"
@@ -72,11 +75,19 @@ lock_t* get_lock(shared_t shared, const void* addr){
     else{
         segment_start = region->allocs[segment_id-1];
     }
-    // cout << "SEGMENT START: " << segment_start << " ADDR: " << addr << endl;
+    //cout << "SEGMENT START: " << segment_start << " ADDR: " << addr << endl;
     uint64_t offset = (reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(segment_start)) / region->align;
-    // cout << "OFFSET: " << offset << endl;
+    //cout << "OFFSET: " << offset << endl;
     region->vector_lock.lock_shared();
     lock_t& lock = region->locks[segment_id][offset];
+    if(segment_id >= region->locks.size()){
+        cout << "LOSER" << endl;
+    }
+    if(region->locks[segment_id] == nullptr){
+        cout << "SEGMENT ID" << segment_id << "SEGMENT START: " << segment_start << " ADDR: " << addr << endl;
+        cout << "OFFSET: " << offset << endl;
+        cout << "FAILED FAILED FAILED" << endl;
+    }
     region->vector_lock.unlock_shared();
 
     return &lock;
@@ -91,7 +102,7 @@ void abort_transaction(shared_t shared, tx_t tx){
     region->vector_lock.lock();
     for(auto segment_id : transaction->segment_ids){
         free(region->allocs[segment_id-1]);
-        delete region->locks[segment_id];
+        delete[] region->locks[segment_id];
         region->allocs[segment_id-1] = 0;
         region->locks[segment_id] = 0;
     }
@@ -113,7 +124,7 @@ shared_t tm_create(size_t size, size_t align) noexcept{
     // We allocate the shared memory buffer such that its words are correctly
     // aligned.
     if (posix_memalign(&(region->start), align, size) != 0) {
-        free(region);
+        delete region;
         return invalid_shared;
     }
     memset(region->start, 0, size);
@@ -138,9 +149,10 @@ void tm_destroy(shared_t shared) noexcept{
     
     region->vector_lock.lock();
     for(unsigned int i = 0; i < region->locks.size(); i ++){
-        delete region->locks[i];
-        if(i < region->locks.size()-1 && region->allocs[i] != 0)
-            free(region->allocs[i]);
+        if(region->locks[i] != nullptr)
+            delete[] region->locks[i];
+        if(i > 0 && region->allocs[i-1] != 0)
+            free(region->allocs[i-1]);
     }
     region->vector_lock.unlock();
 
@@ -268,6 +280,11 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     // cout << "[DEBUG] Transaction Read Version: " << read_tx->rv << endl;
     //if it is read only
     lock_t* lock = get_lock(shared, source);
+    if (lock == nullptr) {
+        cout << "Error: lock is nullptr!" << endl;
+        abort_transaction(shared, tx);
+        abort();  // Or other error handling
+    }
     int version = get_version(lock);
     // cout << "[DEBUG] Lock Address: " << lock << endl;
     // cout << "[DEBUG] Lock State: " << (is_locked(lock) ? "Locked" : "Unlocked") << endl;
@@ -390,8 +407,8 @@ bool tm_free(shared_t shared, tx_t unused(tx), void* segment) noexcept{
 
     region->vector_lock.lock();
     free(region->allocs[segment_id-1]);
-    delete region->locks[segment_id];
-    region->allocs[segment_id] = 0;
+    delete[] region->locks[segment_id];
+    region->allocs[segment_id-1] = 0;
     region->locks[segment_id] = 0;
     region->vector_lock.unlock();
 
