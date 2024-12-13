@@ -25,12 +25,12 @@ bool lock_acquire(struct lock_t* lock);
 /** Release the given lock.
  * @param lock Lock to release
 **/
-void lock_release(struct lock_t* lock, int new_version);
+bool lock_release(struct lock_t* lock, uint64_t new_version);
 
 /** Release the given lock.
  * @param lock Lock to release
 **/
-void lock_release(struct lock_t* lock);
+bool lock_release(struct lock_t* lock);
 
 /** Get the current version of the lock.
  * @param lock Lock to query
@@ -43,3 +43,5 @@ uint64_t get_version(struct lock_t* lock);
  * @return Whether the lock is locked
 **/
 bool is_locked(struct lock_t* lock);
+
+uint64_t get_lock(struct lock_t* lock);
