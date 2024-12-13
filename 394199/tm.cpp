@@ -93,10 +93,10 @@ lock_t* get_lock(shared_t shared, const void* addr){
 
 void abort_transaction(shared_t shared, tx_t tx){
     // cout << "aborting" << endl;
-    // Region* region = (struct Region*) shared;
-    // Transaction* transaction = reinterpret_cast<Transaction*>(tx);
-    // transaction->read_set.clear();
-    // transaction->write_set.clear();
+    Region* region = (struct Region*) shared;
+    Transaction* transaction = reinterpret_cast<Transaction*>(tx);
+    transaction->read_set.clear();
+    transaction->write_set.clear();
     // region->vector_lock.lock();
     // for(auto segment_id : transaction->segment_ids){
     //     free(region->allocs[segment_id-1]);
@@ -105,8 +105,7 @@ void abort_transaction(shared_t shared, tx_t tx){
     //     region->locks[segment_id] = 0;
     // }
     // transaction->segment_ids.clear();
-    // cout << "OK" << endl;
-    // region->vector_lock.unlock();
+    region->vector_lock.unlock();
 }
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
@@ -143,21 +142,21 @@ shared_t tm_create(size_t size, size_t align) noexcept{
 **/
 void tm_destroy(shared_t shared) noexcept{
     // cout << "destroying" << endl;
-    // Region* region = (struct Region*) shared;
+    Region* region = (struct Region*) shared;
     
-    // region->vector_lock.lock();
-    // for(unsigned int i = 0; i < region->locks.size(); i ++){
-    //     if(region->locks[i] != nullptr)
-    //         delete[] region->locks[i];
-    //     if(i > 0 && region->allocs[i-1] != 0)
-    //         free(region->allocs[i-1]);
-    // }
-    // region->vector_lock.unlock();
+    region->vector_lock.lock();
+    for(unsigned int i = 0; i < region->locks.size(); i ++){
+        if(region->locks[i] != nullptr)
+            delete[] region->locks[i];
+        if(i > 0 && region->allocs[i-1] != 0)
+            free(region->allocs[i-1]);
+    }
+    region->vector_lock.unlock();
 
-    // free(region->start);
-    // region->locks.clear();
-    // region->allocs.clear();
-    // delete region;
+    free(region->start);
+    region->locks.clear();
+    region->allocs.clear();
+    delete region;
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -391,15 +390,15 @@ Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) noexcept{
 **/
 bool tm_free(shared_t shared, tx_t unused(tx), void* segment) noexcept{
     // cout << "freeing" << endl;
-    // struct Region* region = (struct Region*) shared;
-    // uint16_t segment_id = reinterpret_cast<uintptr_t>(segment) >> 48;
+    struct Region* region = (struct Region*) shared;
+    uint16_t segment_id = reinterpret_cast<uintptr_t>(segment) >> 48;
 
-    // region->vector_lock.lock();
-    // free(region->allocs[segment_id-1]);
-    // delete[] region->locks[segment_id];
-    // region->allocs[segment_id-1] = 0;
-    // region->locks[segment_id] = 0;
-    // region->vector_lock.unlock();
+    region->vector_lock.lock();
+    free(region->allocs[segment_id-1]);
+    delete[] region->locks[segment_id];
+    region->allocs[segment_id-1] = 0;
+    region->locks[segment_id] = 0;
+    region->vector_lock.unlock();
 
     return true;
 }
