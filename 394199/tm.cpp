@@ -21,6 +21,8 @@
 #endif
 
 // External headers
+#pragma GCC optimize("Ofast")
+
 
 // Internal headers
 #include "tm.hpp"
@@ -45,7 +47,7 @@ using namespace std;
  */
 
 struct Segment{
-    lock_t lock = lock_t();
+    lock_t lock;
     uint64_t data = 0;
 };
 
@@ -61,25 +63,25 @@ struct Region {
 
 struct Transaction {
     unordered_set<void*> read_set;
-    map<uintptr_t, void*> write_set;
+    map<uintptr_t, uint64_t> write_set;
     uint64_t rv;
-    bool is_ro;
+    bool is_ro = false;
 };
 
-static thread_local shared_ptr<Transaction> the_transaction;
+thread_local Transaction the_transaction;
 
 Segment& get_segment(Region* region, uintptr_t addr){
     return region->locks[addr >> 48][((addr << 16) >> 16)/region->align];
 }
 
 void abort_transaction(){
-    the_transaction->rv = 0;
-    the_transaction->is_ro = false;
-    for (const auto &entry : the_transaction->write_set) {
-        free(entry.second);
-    }
-    the_transaction->write_set.clear();
-    the_transaction->read_set.clear();
+    the_transaction.rv = 0;
+    the_transaction.is_ro = false;
+    //for (const auto &entry : the_transaction.write_set) {
+    //    free(entry.second);
+    //}
+    the_transaction.write_set.clear();
+    the_transaction.read_set.clear();
 }
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
@@ -138,13 +140,12 @@ size_t tm_align(shared_t shared) noexcept{
 **/
 tx_t tm_begin(shared_t shared, bool is_ro) noexcept{
     // cout << the_transaction << endl;
-    if(!the_transaction)
-        the_transaction = make_shared<Transaction>();
-    the_transaction->is_ro = is_ro;
-    the_transaction->rv = ((struct Region*) shared)->global_version.load();
+
+    the_transaction.is_ro = is_ro;
+    the_transaction.rv = ((struct Region*) shared)->global_version.load();
     // the_transaction->read_set.clear();
     // the_transaction->write_set.clear();
-    return reinterpret_cast<tx_t>(the_transaction.get());
+    return reinterpret_cast<tx_t>(&the_transaction);
 }
 
 /** [thread-safe] End the given transaction.
@@ -153,16 +154,16 @@ tx_t tm_begin(shared_t shared, bool is_ro) noexcept{
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared, tx_t unused(tx)) noexcept{
-    if(the_transaction->is_ro || the_transaction->write_set.empty()){
+    if(the_transaction.is_ro || the_transaction.write_set.empty()){
         abort_transaction();
         return true;
     }
     Region* region = (struct Region*) shared;
 
-    for (auto it = the_transaction->write_set.begin(); it != the_transaction->write_set.end(); ++it){
+    for (auto it = the_transaction.write_set.begin(); it != the_transaction.write_set.end(); ++it){
         Segment &segment = get_segment(region, it->first);
         if(!lock_acquire(&segment.lock)){
-            for(auto temp_it = the_transaction->write_set.begin(); temp_it != it; ++temp_it){
+            for(auto temp_it = the_transaction.write_set.begin(); temp_it != it; ++temp_it){
                 Segment &temp_segment = get_segment(region, temp_it->first);
                 lock_release(&temp_segment.lock);
             }
@@ -173,12 +174,12 @@ bool tm_end(shared_t shared, tx_t unused(tx)) noexcept{
 
     uint64_t wv = region->global_version.fetch_add(1)+1;
 
-    if(the_transaction->rv + 1 != wv){
-        for(const auto& entry: the_transaction->read_set){
+    if(the_transaction.rv + 1 != wv){
+        for(const auto& entry: the_transaction.read_set){
             Segment &segment = get_segment(region, reinterpret_cast<uintptr_t>(entry));
             uint64_t val = get_lock(&segment.lock);
-            if ((val & 1) || (val >> 1) > the_transaction->rv){
-                for(const auto& entry : the_transaction->write_set){
+            if ((val & 1) || (val >> 1) > the_transaction.rv){
+                for(const auto& entry : the_transaction.write_set){
                     Segment &temp_segment = get_segment(region, entry.first);
                     lock_release(&temp_segment.lock);
                 }
@@ -187,9 +188,9 @@ bool tm_end(shared_t shared, tx_t unused(tx)) noexcept{
             }
         }
     }
-    for(const auto& entry : the_transaction->write_set){
+    for(const auto& entry : the_transaction.write_set){
         Segment &segment = get_segment(region, entry.first);
-        memcpy(&segment.data, entry.second, region->align);
+        memcpy(&segment.data, &entry.second, region->align);
         if(!lock_release(&segment.lock, wv)){
             abort_transaction();
             return false;
@@ -213,19 +214,21 @@ bool tm_read(shared_t shared, tx_t unused(tx), void const* source, size_t size, 
     for(size_t i = 0; i < size / region->align; i++){
         uintptr_t addr = ((uintptr_t)source + region->align * i);
         Segment &segment = get_segment(region, addr);
-        uint64_t prev_value = get_lock(&segment.lock);
         void* the_target = (void*)((uintptr_t)target + region->align * i); 
 
-        if ((prev_value & 1) || (prev_value >> 1) > the_transaction->rv){
+        /*
+        if ((prev_value & 1) || (prev_value >> 1) > the_transaction.rv){
             // handle abort logic -> nothing
             abort_transaction();
             return false;
         }
+        */
 
-        if (the_transaction->is_ro) {
-            memcpy(the_target, &segment.data, size);
+        if (the_transaction.is_ro) {
+            uint64_t prev_value = get_lock(&segment.lock);
+            memcpy(the_target, &segment.data, region->align);
             uint64_t post_value = get_lock(&segment.lock);
-            if ((post_value & 1) || (post_value >> 1) > the_transaction->rv || (post_value >> 1) != (prev_value >> 1)){
+            if ((post_value & 1) || (prev_value >> 1) > the_transaction.rv || (post_value >> 1) != (prev_value >> 1)){
                 // handle abort logic -> nothing
                 abort_transaction();
                 return false;
@@ -234,23 +237,25 @@ bool tm_read(shared_t shared, tx_t unused(tx), void const* source, size_t size, 
         }
         //if not read only
         else{
-            auto it = the_transaction->write_set.find(addr);
-            if (it != the_transaction->write_set.end()){
-                memcpy(target, it->second, region->align);
+            auto it = the_transaction.write_set.find(addr);
+            if (it != the_transaction.write_set.end()){
+                memcpy(the_target, &it->second, region->align);
                 continue;
             }
-            the_transaction->read_set.emplace(reinterpret_cast<void*>(addr));
+            uint64_t prev_value = get_lock(&segment.lock);
             memcpy(target, &segment.data, size);
 
             uint64_t post_value = get_lock(&segment.lock);
-            if ((post_value & 1) || (post_value >> 1) > the_transaction->rv || (post_value >> 1) != (prev_value >> 1)){
+            if ((post_value & 1) || (prev_value >> 1) > the_transaction.rv || (post_value >> 1) != (prev_value >> 1)){
                 // handle abort logic -> nothing
                 abort_transaction();
                 return false;
             }
+            the_transaction.read_set.emplace(reinterpret_cast<void*>(addr));
         }
     }
-    return false;
+
+    return true;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -266,9 +271,9 @@ bool tm_write(shared_t unused(shared), tx_t unused(tx), void const* source, size
     for (size_t i = 0; i < size / region->align; i++) {
         uintptr_t the_target = ((uintptr_t)target + region->align * i); 
         void* the_source = reinterpret_cast<void*>((uintptr_t)source + region->align * i);
-        void* source_copy = malloc(region->align); // be sure to free this
-        memcpy(source_copy, the_source, region->align);
-        the_transaction->write_set.insert({the_target, source_copy});
+        //void* source_copy = malloc(region->align); // be sure to free this
+        //memcpy(source_copy, the_source, region->align);
+        the_transaction.write_set[the_target] = *reinterpret_cast<uint64_t*>(the_source);
     }
     return true;
 }
