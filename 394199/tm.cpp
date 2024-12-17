@@ -48,22 +48,33 @@ using namespace std;
 
 struct Segment{
     lock_t lock;
-    uint64_t data = 0;
+    void* data;
+};
+
+struct SegmentVector{
+    vector<Segment> segment_vec;
+    SegmentVector(size_t size): segment_vec(size){}
 };
 
 struct Region {
     Region(size_t size, size_t align): 
-        size(size), align(align), locks(500, vector<Segment>(1500)){}
+        size(size), align(align) {
+            for (size_t i = 0; i < 2; ++i) {
+                segments.push_back(std::make_unique<SegmentVector>(size/align + 10));
+            }
+        }
     size_t size;        // Size of the non-deallocable memory segment (in bytes)
     size_t align;       // Size of a word in the shared memory region (in bytes)
+    size_t start;
     atomic<uint64_t> global_version{0}; // Global version number
     atomic<uint64_t> segment_count{2}; // Global segment count
-    vector<vector<Segment>> locks; //Lock for each segment
+    shared_mutex alloc_lock;
+    vector<unique_ptr<SegmentVector>> segments;
 };
 
 struct Transaction {
     unordered_set<void*> read_set;
-    map<uintptr_t, uint64_t> write_set;
+    map<uintptr_t, void*> write_set;
     uint64_t rv;
     bool is_ro = false;
 };
@@ -71,15 +82,22 @@ struct Transaction {
 thread_local Transaction the_transaction;
 
 Segment& get_segment(Region* region, uintptr_t addr){
-    return region->locks[addr >> 48][((addr << 16) >> 16)/region->align];
+    shared_lock<shared_mutex> shared_lock(region->alloc_lock);
+    SegmentVector* ptr = region->segments[addr >> 48].get();
+    shared_lock.unlock();
+    return ptr->segment_vec[((addr << 16) >> 16)/region->align];
+}
+
+SegmentVector* get_segment_vector(Region* region, uintptr_t addr){
+    return region->segments[addr >> 48].get();
 }
 
 void abort_transaction(){
     the_transaction.rv = 0;
     the_transaction.is_ro = false;
-    //for (const auto &entry : the_transaction.write_set) {
-    //    free(entry.second);
-    //}
+    for (const auto &entry : the_transaction.write_set) {
+       free(entry.second);
+    }
     the_transaction.write_set.clear();
     the_transaction.read_set.clear();
 }
@@ -154,11 +172,14 @@ tx_t tm_begin(shared_t shared, bool is_ro) noexcept{
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared, tx_t unused(tx)) noexcept{
+    // cout << "end" << endl;
     if(the_transaction.is_ro || the_transaction.write_set.empty()){
         abort_transaction();
         return true;
     }
+
     Region* region = (struct Region*) shared;
+    // shared_lock shared_lock(region->alloc_lock);
 
     for (auto it = the_transaction.write_set.begin(); it != the_transaction.write_set.end(); ++it){
         Segment &segment = get_segment(region, it->first);
@@ -190,7 +211,7 @@ bool tm_end(shared_t shared, tx_t unused(tx)) noexcept{
     }
     for(const auto& entry : the_transaction.write_set){
         Segment &segment = get_segment(region, entry.first);
-        memcpy(&segment.data, &entry.second, region->align);
+        memcpy(&segment.data, entry.second, region->align);
         if(!lock_release(&segment.lock, wv)){
             abort_transaction();
             return false;
@@ -209,20 +230,14 @@ bool tm_end(shared_t shared, tx_t unused(tx)) noexcept{
  * @return Whether the whole transaction can continue
 **/
 bool tm_read(shared_t shared, tx_t unused(tx), void const* source, size_t size, void* target) noexcept{
+    // cout << "read" << endl;
     Region* region = (struct Region*) shared;
+    // shared_lock shared_lock(region->alloc_lock);
 
     for(size_t i = 0; i < size / region->align; i++){
         uintptr_t addr = ((uintptr_t)source + region->align * i);
         Segment &segment = get_segment(region, addr);
         void* the_target = (void*)((uintptr_t)target + region->align * i); 
-
-        /*
-        if ((prev_value & 1) || (prev_value >> 1) > the_transaction.rv){
-            // handle abort logic -> nothing
-            abort_transaction();
-            return false;
-        }
-        */
 
         if (the_transaction.is_ro) {
             uint64_t prev_value = get_lock(&segment.lock);
@@ -239,7 +254,7 @@ bool tm_read(shared_t shared, tx_t unused(tx), void const* source, size_t size, 
         else{
             auto it = the_transaction.write_set.find(addr);
             if (it != the_transaction.write_set.end()){
-                memcpy(the_target, &it->second, region->align);
+                memcpy(the_target, it->second, region->align);
                 continue;
             }
             uint64_t prev_value = get_lock(&segment.lock);
@@ -266,14 +281,15 @@ bool tm_read(shared_t shared, tx_t unused(tx), void const* source, size_t size, 
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write(shared_t unused(shared), tx_t unused(tx), void const* source, size_t unused(size), void* target) noexcept{
+bool tm_write(shared_t shared, tx_t unused(tx), void const* source, size_t size, void* target) noexcept{
+    // cout << "write" << endl;
     struct Region *region = (struct Region *)shared;
     for (size_t i = 0; i < size / region->align; i++) {
         uintptr_t the_target = ((uintptr_t)target + region->align * i); 
         void* the_source = reinterpret_cast<void*>((uintptr_t)source + region->align * i);
-        //void* source_copy = malloc(region->align); // be sure to free this
-        //memcpy(source_copy, the_source, region->align);
-        the_transaction.write_set[the_target] = *reinterpret_cast<uint64_t*>(the_source);
+        void* source_copy = malloc(region->align); // free this
+        memcpy(source_copy, the_source, region->align);
+        the_transaction.write_set[the_target] = source_copy;
     }
     return true;
 }
@@ -285,8 +301,11 @@ bool tm_write(shared_t unused(shared), tx_t unused(tx), void const* source, size
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t unused(size), void** target) noexcept{
+Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void** target) noexcept{
+    // cout << "alloc" << endl;
     Region* region = (Region*) shared;
+    unique_lock<shared_mutex> lock(region->alloc_lock);
+    region->segments.push_back(std::make_unique<SegmentVector>(size/region->align + 10));
     *target = (void *)(region->segment_count.fetch_add(1) << 48ULL);
     return Alloc::success;
 }
@@ -298,5 +317,14 @@ Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t unused(size), void** tar
  * @return Whether the whole transaction can continue
 **/
 bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(segment)) noexcept{
+    // struct segment_node* sn = (struct segment_node*) ((uintptr_t) segment - sizeof(struct segment_node));
+
+    // // Remove from the linked list
+    // if (sn->prev) sn->prev->next = sn->next;
+    // else ((struct region*) shared)->allocs = sn->next;
+    // if (sn->next) sn->next->prev = sn->prev;
+
+    // free(sn);
+    
     return true;
 }
