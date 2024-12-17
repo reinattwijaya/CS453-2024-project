@@ -40,6 +40,8 @@
 
 #include "macros.h"
 
+#define SEGMENT_SIZE 1000
+
 using namespace std;
 
 /**
@@ -59,7 +61,7 @@ struct SegmentVector{
 struct Region {
     Region(size_t size, size_t align): 
         size(size), align(align) {
-            for (size_t i = 0; i < 2; ++i) {
+            for (size_t i = 0; i < SEGMENT_SIZE; ++i) {
                 segments.push_back(std::make_unique<SegmentVector>(size/align + 10));
             }
         }
@@ -68,12 +70,13 @@ struct Region {
     size_t start;
     atomic<uint64_t> global_version{0}; // Global version number
     atomic<uint64_t> segment_count{2}; // Global segment count
-    shared_mutex alloc_lock;
+    atomic<uint64_t> segment_size{SEGMENT_SIZE};
+    lock_t alloc_lock;
     vector<unique_ptr<SegmentVector>> segments;
 };
 
 struct Transaction {
-    unordered_set<void*> read_set;
+    unordered_set<void*> read_set, free_set;
     map<uintptr_t, void*> write_set;
     uint64_t rv;
     bool is_ro = false;
@@ -82,9 +85,19 @@ struct Transaction {
 thread_local Transaction the_transaction;
 
 Segment& get_segment(Region* region, uintptr_t addr){
-    shared_lock<shared_mutex> shared_lock(region->alloc_lock);
-    SegmentVector* ptr = region->segments[addr >> 48].get();
-    shared_lock.unlock();
+    uintptr_t temp_addr = addr >> 48;
+    //region->alloc_lock.lock_shared();
+    uint64_t prev_value, post_value;
+    SegmentVector* ptr;
+    do{
+        prev_value = get_lock(&region->alloc_lock);
+        if(prev_value & 1)
+            continue;
+        ptr = region->segments[temp_addr].get();
+        post_value = get_lock(&region->alloc_lock);
+    }
+    while (((post_value & 1) || (post_value >> 1) != (prev_value >> 1)));
+    //region->alloc_lock.unlock_shared();
     return ptr->segment_vec[((addr << 16) >> 16)/region->align];
 }
 
@@ -99,6 +112,7 @@ void abort_transaction(){
        free(entry.second);
     }
     the_transaction.write_set.clear();
+    the_transaction.free_set.clear();
     the_transaction.read_set.clear();
 }
 
@@ -217,6 +231,22 @@ bool tm_end(shared_t shared, tx_t unused(tx)) noexcept{
             return false;
         }
     }
+    
+    //we start doing the free if memory becomes too big and since we have lots of memory
+    //we'll only be doing this if segment_size > 10*SEG_SIZE (not when all is allocated since
+    //we basically stopped the free in the beginning)
+    //basically a balance of creating fast transaction in the beginning and once
+    //we are using too much memory, slow down and start using it efficiently
+    if(region->segment_size.load() > 10*SEGMENT_SIZE){
+        for(const auto& entry: the_transaction.free_set){
+            if(!lock_acquire(&region->alloc_lock)){
+                abort_transaction();
+                return false;
+            }
+            region->segments[((uintptr_t)entry >> 48)].reset();
+            lock_release(&region->alloc_lock, get_version(&region->alloc_lock)+1);
+        }
+    }
     abort_transaction();
     return true;
 }
@@ -301,11 +331,33 @@ bool tm_write(shared_t shared, tx_t unused(tx), void const* source, size_t size,
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
+
+// had to batch out the resize and store because of contention, even if SEGMENT_SIZE = 10,
+// it should still works fine
 Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void** target) noexcept{
-    // cout << "alloc" << endl;
     Region* region = (Region*) shared;
-    unique_lock<shared_mutex> lock(region->alloc_lock);
-    region->segments.push_back(std::make_unique<SegmentVector>(size/region->align + 10));
+    uint64_t cur_segment_count = region->segment_count.fetch_add(1);
+    uint64_t cur_segment_size = region->segment_size.load();
+    if(cur_segment_count >= cur_segment_size){
+        if(!lock_acquire(&region->alloc_lock)){
+            abort_transaction();
+            return Alloc::abort;
+        }
+        for (size_t i = 0; i < SEGMENT_SIZE; ++i) {
+            region->segments.push_back(std::make_unique<SegmentVector>(region->size/region->align + 10));
+        }
+        region->segment_size.store(cur_segment_size+SEGMENT_SIZE);
+        lock_release(&region->alloc_lock, get_version(&region->alloc_lock)+1);
+    }
+    if(size > region->size){
+        if(!lock_acquire(&region->alloc_lock)){
+            abort_transaction();
+            return Alloc::abort;
+        }
+        region->segments.resize(size/region->align + 10);
+        lock_release(&region->alloc_lock, get_version(&region->alloc_lock)+1);
+    }
+
     *target = (void *)(region->segment_count.fetch_add(1) << 48ULL);
     return Alloc::success;
 }
@@ -316,15 +368,10 @@ Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void** target) noe
  * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
 **/
-bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(segment)) noexcept{
-    // struct segment_node* sn = (struct segment_node*) ((uintptr_t) segment - sizeof(struct segment_node));
 
-    // // Remove from the linked list
-    // if (sn->prev) sn->prev->next = sn->next;
-    // else ((struct region*) shared)->allocs = sn->next;
-    // if (sn->next) sn->next->prev = sn->prev;
-
-    // free(sn);
+//put the free in the transaction free queue to free at the end
+bool tm_free(shared_t unused(shared), tx_t unused(tx), void* segment) noexcept{
+    the_transaction.free_set.insert(segment);
     
     return true;
 }
